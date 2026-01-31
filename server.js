@@ -14,8 +14,10 @@ const supabase = createClient(
   process.env.SUPABASE_ANON_KEY
 );
 
+// CORS — bereinigt den Origin-Wert vor dem Setzen
+const origin = (process.env.ALLOWED_ORIGIN || "*").trim().replace(/[\r\n]/g, "");
 app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", process.env.ALLOWED_ORIGIN || "*");
+  res.header("Access-Control-Allow-Origin", origin);
   res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.header("Access-Control-Allow-Headers", "Content-Type");
   next();
