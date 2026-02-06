@@ -1,6 +1,7 @@
 {
   "name": "untitled-worker",
-  "version": "1.0.0",
+  "version": "2.0.0",
+  "description": "Worker for downloading audio via yt-dlp and uploading to Supabase",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
