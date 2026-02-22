@@ -14,7 +14,6 @@ const supabase = createClient(
   process.env.SUPABASE_ANON_KEY
 );
 
-// CORS
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -23,12 +22,10 @@ app.use((req, res, next) => {
   next();
 });
 
-// Health Check
 app.get("/health", (req, res) => {
   res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
 
-// yt-dlp version check
 app.get("/version", (req, res) => {
   try {
     const version = execSync("yt-dlp --version", { encoding: "utf-8" }).trim();
@@ -39,28 +36,109 @@ app.get("/version", (req, res) => {
 });
 
 // ==============================================
-// ENDPOINT 1: /download
-// Accepts: { query: "Artist - Title" }
-// Searches YouTube, downloads MP3, uploads to Supabase
-// Returns: { success, audioUrl, duration, fileName }
+// ENDPOINT: /resolve
+// Accepts: { url: "youtube or spotify url" }
+// Returns metadata without downloading
+// ==============================================
+app.post("/resolve", async (req, res) => {
+  const { url } = req.body;
+  if (!url) return res.status(400).json({ error: "url is required" });
+
+  try {
+    const isSpotify = url.includes("open.spotify.com");
+    const isYoutubePlaylist = url.includes("list=") && !isSpotify;
+    const isSpotifyCollection = isSpotify && (url.includes("/album/") || url.includes("/playlist/"));
+    const useFlat = isYoutubePlaylist || isSpotifyCollection;
+
+    const cmd = `yt-dlp --dump-json --no-download ${useFlat ? "--flat-playlist" : ""} "${url}" 2>/dev/null`;
+    const output = execSync(cmd, { encoding: "utf-8", timeout: 120000 }).trim();
+    const lines = output.split("\n").filter(l => l.trim());
+
+    let type = "track";
+    if (isSpotify && url.includes("/album/")) type = "album";
+    else if (isSpotify && url.includes("/playlist/")) type = "playlist";
+    else if (isYoutubePlaylist) type = "playlist";
+
+    const tracks = lines.map((line, i) => {
+      try {
+        const d = JSON.parse(line);
+        const title = d.track || d.title || "Unknown";
+        const artist = d.artist || d.creator || d.uploader || d.channel || "Unknown";
+        const album = d.album || null;
+
+        // For YouTube flat-playlist entries, title is often "Artist - Title"
+        let resolvedTitle = title;
+        let resolvedArtist = artist;
+        if (useFlat && !isSpotify && title.includes(" - ") && artist === "Unknown") {
+          const parts = title.split(" - ");
+          resolvedArtist = parts[0].trim();
+          resolvedTitle = parts.slice(1).join(" - ").trim();
+        }
+
+        return {
+          title: resolvedTitle,
+          artist: resolvedArtist,
+          album: album || (type === "track" ? "Singles" : null),
+          year: d.release_year || (d.upload_date ? parseInt(d.upload_date.substring(0, 4)) : null),
+          duration: d.duration || 0,
+          thumbnail: d.thumbnail || d.thumbnails?.[0]?.url || null,
+          trackNumber: i + 1,
+          // For YouTube: use direct URL; for Spotify: build search query
+          directUrl: !isSpotify ? (d.url || d.webpage_url || null) : null,
+          searchQuery: `${resolvedArtist} ${resolvedTitle}`.trim(),
+          isYoutube: !isSpotify,
+        };
+      } catch (e) {
+        return null;
+      }
+    }).filter(Boolean);
+
+    if (tracks.length === 0) {
+      return res.status(404).json({ error: "Keine Tracks gefunden für diese URL" });
+    }
+
+    // For collections: set album name from first track if not set per-track
+    if (type !== "track") {
+      const firstAlbum = tracks.find(t => t.album)?.album;
+      if (firstAlbum) {
+        tracks.forEach(t => { if (!t.album) t.album = firstAlbum; });
+      }
+    }
+
+    res.json({ type, total: tracks.length, tracks });
+  } catch (error) {
+    console.error(`[resolve] Error for "${url}":`, error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==============================================
+// ENDPOINT: /download
+// Accepts: { query } OR { url } + optional { metadata }
+// Downloads MP3, uploads to Supabase
+// Returns: { success, audioUrl, duration, title, artist, album, year, thumbnail }
 // ==============================================
 app.post("/download", async (req, res) => {
-  const { query } = req.body;
+  const { query, url: directUrl, metadata = {} } = req.body;
 
-  if (!query) {
-    return res.status(400).json({ error: "query is required" });
+  if (!query && !directUrl) {
+    return res.status(400).json({ error: "query or url is required" });
   }
 
-  const safeTitle = query.replace(/[^a-zA-Z0-9_\- ]/g, "_").substring(0, 60).trim();
+  const label = metadata.title || query || directUrl;
+  const safeLabel = (label || "track").replace(/[^a-zA-Z0-9_\- ]/g, "_").substring(0, 60).trim();
   const uid = uuidv4().substring(0, 8);
-  const fileName = `${safeTitle.replace(/\s+/g, "_")}_${uid}.mp3`;
+  const fileName = `${safeLabel.replace(/\s+/g, "_")}_${uid}.mp3`;
   const tmpDir = path.join(__dirname, "tmp");
   const filePath = path.join(tmpDir, fileName);
 
   if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
 
+  // Build yt-dlp target: direct URL or YouTube search
+  const target = directUrl || `ytsearch1:${query}`;
+
   try {
-    // Search YouTube for the query and download as MP3
+    // Download as MP3
     const ytdlpCmd = [
       "yt-dlp",
       "-x",
@@ -68,31 +146,38 @@ app.post("/download", async (req, res) => {
       "--audio-quality", "192K",
       "--no-playlist",
       "--max-downloads", "1",
+      "--write-info-json",           // save metadata JSON alongside audio
       "-o", filePath,
-      `ytsearch1:${query}`
+      `"${target}"`
     ].join(" ");
 
-    console.log(`[download] Starting: ${query}`);
-    execSync(ytdlpCmd, { stdio: "pipe", timeout: 300000 });
+    console.log(`[download] Starting: ${label}`);
+    execSync(ytdlpCmd, { stdio: "pipe", timeout: 300000, shell: true });
 
-    // yt-dlp might append .mp3 or not depending on version
+    // Find the downloaded file
     let actualPath = filePath;
     if (!fs.existsSync(actualPath) && fs.existsSync(filePath + ".mp3")) {
       actualPath = filePath + ".mp3";
     }
-    // Also check without extension (yt-dlp sometimes strips it)
     if (!fs.existsSync(actualPath)) {
-      const files = fs.readdirSync(tmpDir).filter(f => f.includes(uid));
-      if (files.length > 0) {
-        actualPath = path.join(tmpDir, files[0]);
+      const files = fs.readdirSync(tmpDir).filter(f => f.includes(uid) && !f.endsWith(".json"));
+      if (files.length > 0) actualPath = path.join(tmpDir, files[0]);
+    }
+    if (!fs.existsSync(actualPath)) {
+      return res.status(500).json({ error: "Download fehlgeschlagen: Datei nicht gefunden" });
+    }
+
+    // Try to read yt-dlp metadata JSON
+    let ytMeta = {};
+    try {
+      const jsonFiles = fs.readdirSync(tmpDir).filter(f => f.includes(uid) && f.endsWith(".info.json"));
+      if (jsonFiles.length > 0) {
+        ytMeta = JSON.parse(fs.readFileSync(path.join(tmpDir, jsonFiles[0]), "utf-8"));
+        fs.unlinkSync(path.join(tmpDir, jsonFiles[0]));
       }
-    }
+    } catch (e) {}
 
-    if (!fs.existsSync(actualPath)) {
-      return res.status(500).json({ error: "Download failed: file not created" });
-    }
-
-    // Get duration via ffprobe if available, otherwise estimate from file size
+    // Get duration
     let duration = 0;
     try {
       const durationStr = execSync(
@@ -101,12 +186,11 @@ app.post("/download", async (req, res) => {
       ).trim();
       duration = Math.floor(parseFloat(durationStr));
     } catch (e) {
-      // Estimate: ~1 min per MB at 192kbps
       const stats = fs.statSync(actualPath);
-      duration = Math.floor((stats.size / (192000 / 8)));
+      duration = Math.floor(stats.size / (192000 / 8));
     }
 
-    // Upload to Supabase Storage
+    // Upload to Supabase
     const fileBuffer = fs.readFileSync(actualPath);
     const { error: uploadError } = await supabase.storage
       .from("audio-files")
@@ -114,51 +198,48 @@ app.post("/download", async (req, res) => {
 
     if (uploadError) throw new Error("Supabase upload failed: " + uploadError.message);
 
-    const { data: urlData } = supabase.storage
-      .from("audio-files")
-      .getPublicUrl(fileName);
+    const { data: urlData } = supabase.storage.from("audio-files").getPublicUrl(fileName);
 
-    // Cleanup
     fs.unlinkSync(actualPath);
 
-    console.log(`[download] Done: ${query} → ${fileName} (${duration}s)`);
+    // Build final metadata: prefer passed-in metadata, fallback to yt-dlp
+    const finalTitle = metadata.title || ytMeta.track || ytMeta.title || safeLabel;
+    const finalArtist = metadata.artist || ytMeta.artist || ytMeta.creator || ytMeta.uploader || "Unknown";
+    const finalAlbum = metadata.album || ytMeta.album || null;
+    const finalYear = metadata.year || ytMeta.release_year || (ytMeta.upload_date ? parseInt(ytMeta.upload_date.substring(0, 4)) : null);
+    const finalThumbnail = metadata.thumbnail || ytMeta.thumbnail || null;
+
+    console.log(`[download] Done: ${finalTitle} (${duration}s)`);
 
     res.json({
       success: true,
       audioUrl: urlData.publicUrl,
-      duration: duration,
-      fileName: fileName
+      duration,
+      fileName,
+      title: finalTitle,
+      artist: finalArtist,
+      album: finalAlbum,
+      year: finalYear,
+      thumbnail: finalThumbnail,
     });
   } catch (error) {
-    // Cleanup on error
     try {
-      const files = fs.readdirSync(tmpDir).filter(f => f.includes(uid));
-      files.forEach(f => fs.unlinkSync(path.join(tmpDir, f)));
+      fs.readdirSync(tmpDir).filter(f => f.includes(uid)).forEach(f => {
+        try { fs.unlinkSync(path.join(tmpDir, f)); } catch (e) {}
+      });
     } catch (e) {}
-    console.error(`[download] Error for "${query}":`, error.message);
+    console.error(`[download] Error for "${label}":`, error.message);
     res.status(500).json({ error: error.message });
   }
 });
 
-// ==============================================
-// ENDPOINT 2: /metadata
-// Accepts: { url: "https://open.spotify.com/track/..." }
-// Uses yt-dlp to extract metadata from Spotify URL
-// Returns track info without downloading
-// ==============================================
+// Legacy /metadata endpoint (kept for backwards compat)
 app.post("/metadata", async (req, res) => {
   const { url } = req.body;
-
-  if (!url) {
-    return res.status(400).json({ error: "url is required" });
-  }
-
+  if (!url) return res.status(400).json({ error: "url is required" });
   try {
-    // Use yt-dlp to dump JSON metadata from the Spotify URL
     const cmd = `yt-dlp --dump-json --no-download --flat-playlist "${url}" 2>/dev/null`;
     const output = execSync(cmd, { encoding: "utf-8", timeout: 60000 });
-
-    // yt-dlp outputs one JSON object per line for playlists
     const lines = output.trim().split("\n").filter(l => l.trim());
     const tracks = lines.map(line => {
       try {
@@ -172,33 +253,15 @@ app.post("/metadata", async (req, res) => {
           spotifyUrl: data.url || data.webpage_url || url,
           thumbnail: data.thumbnail || data.thumbnails?.[0]?.url || null
         };
-      } catch (e) {
-        return null;
-      }
+      } catch (e) { return null; }
     }).filter(Boolean);
-
-    if (tracks.length === 0) {
-      return res.status(404).json({ error: "No tracks found for this URL" });
-    }
-
-    // Detect type based on URL
+    if (tracks.length === 0) return res.status(404).json({ error: "No tracks found" });
     let type = "track";
     if (url.includes("/album/")) type = "album";
     if (url.includes("/playlist/")) type = "playlist";
-
     res.json({ type, tracks });
   } catch (error) {
-    console.error(`[metadata] Error for "${url}":`, error.message);
-
-    // Fallback: try to parse the URL manually for basic info
-    if (url.includes("open.spotify.com")) {
-      res.status(500).json({
-        error: "Could not extract metadata. yt-dlp may not support this Spotify URL directly.",
-        hint: "Try providing track details manually or wait for Spotify API integration."
-      });
-    } else {
-      res.status(500).json({ error: error.message });
-    }
+    res.status(500).json({ error: error.message });
   }
 });
 
