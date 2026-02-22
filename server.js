@@ -6,6 +6,18 @@ const fs = require("fs");
 const path = require("path");
 require("dotenv").config();
 
+// Find yt-dlp binary at startup (Node.js PATH != shell PATH)
+let YTDLP_BIN = "yt-dlp";
+try {
+  YTDLP_BIN = execSync("which yt-dlp", { encoding: "utf-8" }).trim();
+  console.log("[startup] yt-dlp found at:", YTDLP_BIN);
+} catch (_) {
+  for (const p of ["/usr/local/bin/yt-dlp", "/usr/bin/yt-dlp", "/home/render/.local/bin/yt-dlp"]) {
+    if (fs.existsSync(p)) { YTDLP_BIN = p; break; }
+  }
+  console.log("[startup] yt-dlp binary:", YTDLP_BIN);
+}
+
 // Write YouTube cookies to disk at startup if provided via env
 const COOKIES_FILE = "/tmp/yt-cookies.txt";
 if (process.env.YT_COOKIES) {
@@ -15,8 +27,7 @@ if (process.env.YT_COOKIES) {
   console.log("[startup] No YT_COOKIES set – downloads may fail due to bot detection");
 }
 
-// Safe yt-dlp wrapper – uses execFileSync (no shell), captures stderr
-// Automatically injects cookies + android client args
+// Safe yt-dlp wrapper – automatically injects cookies + android client args
 function ytdlp(args, timeout = 120000) {
   const extraArgs = [
     "--extractor-args", "youtube:player_client=android_music,web",
@@ -26,10 +37,11 @@ function ytdlp(args, timeout = 120000) {
   }
   const fullArgs = [...extraArgs, ...args];
   try {
-    const stdout = execFileSync("yt-dlp", fullArgs, {
+    const stdout = execFileSync(YTDLP_BIN, fullArgs, {
       encoding: "utf-8",
       timeout,
       stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, PATH: `/usr/local/bin:/usr/bin:/bin:${process.env.PATH || ""}` },
     });
     return { stdout, stderr: "", ok: true };
   } catch (e) {
@@ -57,19 +69,20 @@ async function spotifyMeta(url) {
   if (!r.ok) throw new Error(`Spotify oEmbed fehlgeschlagen: ${r.status}`);
   const data = await r.json();
 
-  // oEmbed title is "Song Name" for tracks – search query will be built from it
+  // oEmbed title is the track name; use it directly as search query (no "Unknown" prefix)
+  const title = data.title || "Unknown";
   return {
     type,
     tracks: [{
-      title: data.title || "Unknown",
-      artist: "Unknown",  // oEmbed doesn't give artist separately; yt-dlp will fill it during download
+      title,
+      artist: null,
       album: null,
       year: null,
       duration: 0,
       thumbnail: data.thumbnail_url || null,
       trackNumber: 1,
       directUrl: null,
-      searchQuery: data.title || "",
+      searchQuery: title,  // clean search query: just the song title
       isYoutube: false,
     }],
   };
@@ -289,10 +302,11 @@ app.post("/download", async (req, res) => {
 
     fs.unlinkSync(actualPath);
 
-    // Build final metadata: prefer passed-in metadata, fallback to yt-dlp
-    const finalTitle = metadata.title || ytMeta.track || ytMeta.title || safeLabel;
-    const finalArtist = metadata.artist || ytMeta.artist || ytMeta.creator || ytMeta.uploader || "Unknown";
-    const finalAlbum = metadata.album || ytMeta.album || null;
+    // Build final metadata: yt-dlp values override "Unknown"/null placeholders from metadata
+    const ytArtist = ytMeta.artist || ytMeta.creator || ytMeta.uploader || null;
+    const finalTitle = (metadata.title && metadata.title !== "Unknown") ? metadata.title : (ytMeta.track || ytMeta.title || safeLabel);
+    const finalArtist = (metadata.artist && metadata.artist !== "Unknown") ? metadata.artist : (ytArtist || "Unknown");
+    const finalAlbum = (metadata.album && metadata.album !== "Unknown") ? metadata.album : (ytMeta.album || null);
     const finalYear = metadata.year || ytMeta.release_year || (ytMeta.upload_date ? parseInt(ytMeta.upload_date.substring(0, 4)) : null);
     const finalThumbnail = metadata.thumbnail || ytMeta.thumbnail || null;
 
