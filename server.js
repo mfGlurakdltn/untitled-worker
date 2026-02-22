@@ -6,8 +6,8 @@ const fs = require("fs");
 const path = require("path");
 require("dotenv").config();
 
-// yt-dlp binary – installed via curl in render.yaml buildCommand
-const YTDLP_BIN = "/usr/local/bin/yt-dlp";
+// yt-dlp binary – downloaded to project root in render.yaml buildCommand
+const YTDLP_BIN = path.join(__dirname, "yt-dlp");
 if (fs.existsSync(YTDLP_BIN)) {
   try {
     const ver = execFileSync(YTDLP_BIN, ["--version"], { encoding: "utf-8" }).trim();
