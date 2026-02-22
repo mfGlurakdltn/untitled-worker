@@ -6,16 +6,17 @@ const fs = require("fs");
 const path = require("path");
 require("dotenv").config();
 
-// Find yt-dlp binary at startup (Node.js PATH != shell PATH)
-let YTDLP_BIN = "yt-dlp";
-try {
-  YTDLP_BIN = execSync("which yt-dlp", { encoding: "utf-8" }).trim();
-  console.log("[startup] yt-dlp found at:", YTDLP_BIN);
-} catch (_) {
-  for (const p of ["/usr/local/bin/yt-dlp", "/usr/bin/yt-dlp", "/home/render/.local/bin/yt-dlp"]) {
-    if (fs.existsSync(p)) { YTDLP_BIN = p; break; }
+// yt-dlp binary – installed via curl in render.yaml buildCommand
+const YTDLP_BIN = "/usr/local/bin/yt-dlp";
+if (fs.existsSync(YTDLP_BIN)) {
+  try {
+    const ver = execFileSync(YTDLP_BIN, ["--version"], { encoding: "utf-8" }).trim();
+    console.log("[startup] yt-dlp OK:", ver);
+  } catch (e) {
+    console.warn("[startup] yt-dlp exists but --version failed:", e.message);
   }
-  console.log("[startup] yt-dlp binary:", YTDLP_BIN);
+} else {
+  console.error("[startup] yt-dlp NOT FOUND at", YTDLP_BIN, "– downloads will fail");
 }
 
 // Write YouTube cookies to disk at startup if provided via env
@@ -115,6 +116,30 @@ app.get("/version", (req, res) => {
   } catch (e) {
     res.status(500).json({ error: "yt-dlp not found" });
   }
+});
+
+app.get("/debug", (req, res) => {
+  const checks = {};
+  // Binary exists?
+  checks.ytdlp_bin_exists = fs.existsSync(YTDLP_BIN);
+  // Version
+  try {
+    checks.ytdlp_version = execFileSync(YTDLP_BIN, ["--version"], { encoding: "utf-8", timeout: 10000 }).trim();
+  } catch (e) {
+    checks.ytdlp_version_error = e.message;
+  }
+  // ffprobe
+  try {
+    checks.ffprobe_version = execSync("ffprobe -version 2>&1 | head -1", { encoding: "utf-8", timeout: 5000 }).trim();
+  } catch (e) {
+    checks.ffprobe_error = e.message;
+  }
+  // Cookies
+  checks.cookies_file_exists = fs.existsSync(COOKIES_FILE);
+  checks.yt_cookies_env_set = !!process.env.YT_COOKIES;
+  // PATH
+  checks.path = process.env.PATH;
+  res.json(checks);
 });
 
 // ==============================================
