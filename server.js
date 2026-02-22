@@ -6,10 +6,27 @@ const fs = require("fs");
 const path = require("path");
 require("dotenv").config();
 
+// Write YouTube cookies to disk at startup if provided via env
+const COOKIES_FILE = "/tmp/yt-cookies.txt";
+if (process.env.YT_COOKIES) {
+  fs.writeFileSync(COOKIES_FILE, process.env.YT_COOKIES, "utf-8");
+  console.log("[startup] YouTube cookies written to", COOKIES_FILE);
+} else {
+  console.log("[startup] No YT_COOKIES set – downloads may fail due to bot detection");
+}
+
 // Safe yt-dlp wrapper – uses execFileSync (no shell), captures stderr
+// Automatically injects cookies + android client args
 function ytdlp(args, timeout = 120000) {
+  const extraArgs = [
+    "--extractor-args", "youtube:player_client=android_music,web",
+  ];
+  if (fs.existsSync(COOKIES_FILE)) {
+    extraArgs.push("--cookies", COOKIES_FILE);
+  }
+  const fullArgs = [...extraArgs, ...args];
   try {
-    const stdout = execFileSync("yt-dlp", args, {
+    const stdout = execFileSync("yt-dlp", fullArgs, {
       encoding: "utf-8",
       timeout,
       stdio: ["pipe", "pipe", "pipe"],
