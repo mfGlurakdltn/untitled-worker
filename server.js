@@ -1,10 +1,62 @@
 const express = require("express");
 const { createClient } = require("@supabase/supabase-js");
-const { execSync } = require("child_process");
+const { execSync, execFileSync } = require("child_process");
 const { v4: uuidv4 } = require("uuid");
 const fs = require("fs");
 const path = require("path");
 require("dotenv").config();
+
+// Safe yt-dlp wrapper – uses execFileSync (no shell), captures stderr
+function ytdlp(args, timeout = 120000) {
+  try {
+    const stdout = execFileSync("yt-dlp", args, {
+      encoding: "utf-8",
+      timeout,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    return { stdout, stderr: "", ok: true };
+  } catch (e) {
+    return {
+      stdout: (e.stdout || "").toString(),
+      stderr: (e.stderr || e.message || "").toString(),
+      ok: false,
+    };
+  }
+}
+
+// Spotify metadata via page scrape (no API key needed)
+async function spotifyMeta(url) {
+  const trackId = url.match(/\/track\/([a-zA-Z0-9]+)/)?.[1];
+  const albumId = url.match(/\/album\/([a-zA-Z0-9]+)/)?.[1];
+  const playlistId = url.match(/\/playlist\/([a-zA-Z0-9]+)/)?.[1];
+  const id = trackId || albumId || playlistId;
+  const type = trackId ? "track" : albumId ? "album" : "playlist";
+
+  if (!id) throw new Error("Ungültige Spotify URL");
+
+  // Spotify oEmbed gives us at least a title + thumbnail for single tracks
+  const embedUrl = `https://open.spotify.com/oembed?url=${encodeURIComponent(url)}`;
+  const r = await fetch(embedUrl, { headers: { "User-Agent": "Mozilla/5.0" } });
+  if (!r.ok) throw new Error(`Spotify oEmbed fehlgeschlagen: ${r.status}`);
+  const data = await r.json();
+
+  // oEmbed title is "Song Name" for tracks – search query will be built from it
+  return {
+    type,
+    tracks: [{
+      title: data.title || "Unknown",
+      artist: "Unknown",  // oEmbed doesn't give artist separately; yt-dlp will fill it during download
+      album: null,
+      year: null,
+      duration: 0,
+      thumbnail: data.thumbnail_url || null,
+      trackNumber: 1,
+      directUrl: null,
+      searchQuery: data.title || "",
+      isYoutube: false,
+    }],
+  };
+}
 
 const app = express();
 app.use(express.json());
@@ -44,20 +96,35 @@ app.post("/resolve", async (req, res) => {
   const { url } = req.body;
   if (!url) return res.status(400).json({ error: "url is required" });
 
+  const isSpotify = url.includes("open.spotify.com");
+  const isYoutubePlaylist = (url.includes("youtube.com") || url.includes("youtu.be")) && url.includes("list=");
+  const isSpotifyCollection = isSpotify && (url.includes("/album/") || url.includes("/playlist/"));
+  const useFlat = isYoutubePlaylist || isSpotifyCollection;
+
+  let type = "track";
+  if (isSpotify && url.includes("/album/")) type = "album";
+  else if (isSpotify && url.includes("/playlist/")) type = "playlist";
+  else if (isYoutubePlaylist) type = "playlist";
+
   try {
-    const isSpotify = url.includes("open.spotify.com");
-    const isYoutubePlaylist = url.includes("list=") && !isSpotify;
-    const isSpotifyCollection = isSpotify && (url.includes("/album/") || url.includes("/playlist/"));
-    const useFlat = isYoutubePlaylist || isSpotifyCollection;
+    // Build yt-dlp args (no shell = no escaping issues)
+    const args = ["--dump-json", "--no-download", "--no-warnings"];
+    if (useFlat) args.push("--flat-playlist");
+    args.push(url);
 
-    const cmd = `yt-dlp --dump-json --no-download ${useFlat ? "--flat-playlist" : ""} "${url}" 2>/dev/null`;
-    const output = execSync(cmd, { encoding: "utf-8", timeout: 120000 }).trim();
-    const lines = output.split("\n").filter(l => l.trim());
+    const { stdout, stderr, ok } = ytdlp(args);
 
-    let type = "track";
-    if (isSpotify && url.includes("/album/")) type = "album";
-    else if (isSpotify && url.includes("/playlist/")) type = "playlist";
-    else if (isYoutubePlaylist) type = "playlist";
+    // If yt-dlp failed or produced no output, try Spotify fallback
+    if (!ok || !stdout.trim()) {
+      if (isSpotify) {
+        console.log(`[resolve] yt-dlp failed for Spotify, using oEmbed fallback. Error: ${stderr.substring(0, 150)}`);
+        const fallback = await spotifyMeta(url);
+        return res.json({ ...fallback, total: fallback.tracks.length });
+      }
+      throw new Error(stderr.substring(0, 300) || "yt-dlp produced no output");
+    }
+
+    const lines = stdout.trim().split("\n").filter(l => l.trim());
 
     const tracks = lines.map((line, i) => {
       try {
@@ -66,10 +133,10 @@ app.post("/resolve", async (req, res) => {
         const artist = d.artist || d.creator || d.uploader || d.channel || "Unknown";
         const album = d.album || null;
 
-        // For YouTube flat-playlist entries, title is often "Artist - Title"
         let resolvedTitle = title;
         let resolvedArtist = artist;
-        if (useFlat && !isSpotify && title.includes(" - ") && artist === "Unknown") {
+        // YouTube flat-playlist titles are often "Artist - Title"
+        if (useFlat && !isSpotify && title.includes(" - ") && (artist === "Unknown" || !d.artist)) {
           const parts = title.split(" - ");
           resolvedArtist = parts[0].trim();
           resolvedTitle = parts.slice(1).join(" - ").trim();
@@ -78,12 +145,11 @@ app.post("/resolve", async (req, res) => {
         return {
           title: resolvedTitle,
           artist: resolvedArtist,
-          album: album || (type === "track" ? "Singles" : null),
+          album: album || null,
           year: d.release_year || (d.upload_date ? parseInt(d.upload_date.substring(0, 4)) : null),
           duration: d.duration || 0,
           thumbnail: d.thumbnail || d.thumbnails?.[0]?.url || null,
           trackNumber: i + 1,
-          // For YouTube: use direct URL; for Spotify: build search query
           directUrl: !isSpotify ? (d.url || d.webpage_url || null) : null,
           searchQuery: `${resolvedArtist} ${resolvedTitle}`.trim(),
           isYoutube: !isSpotify,
@@ -94,15 +160,13 @@ app.post("/resolve", async (req, res) => {
     }).filter(Boolean);
 
     if (tracks.length === 0) {
-      return res.status(404).json({ error: "Keine Tracks gefunden für diese URL" });
+      return res.status(404).json({ error: "Keine Tracks gefunden" });
     }
 
-    // For collections: set album name from first track if not set per-track
+    // Propagate album name across collection tracks
     if (type !== "track") {
       const firstAlbum = tracks.find(t => t.album)?.album;
-      if (firstAlbum) {
-        tracks.forEach(t => { if (!t.album) t.album = firstAlbum; });
-      }
+      if (firstAlbum) tracks.forEach(t => { if (!t.album) t.album = firstAlbum; });
     }
 
     res.json({ type, total: tracks.length, tracks });
@@ -139,20 +203,26 @@ app.post("/download", async (req, res) => {
 
   try {
     // Download as MP3
-    const ytdlpCmd = [
-      "yt-dlp",
+    const ytdlpArgs = [
       "-x",
       "--audio-format", "mp3",
       "--audio-quality", "192K",
       "--no-playlist",
       "--max-downloads", "1",
-      "--write-info-json",           // save metadata JSON alongside audio
+      "--write-info-json",
+      "--no-warnings",
       "-o", filePath,
-      `"${target}"`
-    ].join(" ");
+      target,
+    ];
 
     console.log(`[download] Starting: ${label}`);
-    execSync(ytdlpCmd, { stdio: "pipe", timeout: 300000, shell: true });
+    const { ok: dlOk, stderr: dlStderr } = ytdlp(ytdlpArgs, 300000);
+    if (!dlOk) {
+      // Check if file was still created despite non-zero exit (common with yt-dlp)
+      const filesExist = fs.existsSync(filePath) || fs.existsSync(filePath + ".mp3") ||
+        fs.readdirSync(tmpDir).some(f => f.includes(uid) && !f.endsWith(".json"));
+      if (!filesExist) throw new Error(dlStderr.substring(0, 300) || "Download fehlgeschlagen");
+    }
 
     // Find the downloaded file
     let actualPath = filePath;
